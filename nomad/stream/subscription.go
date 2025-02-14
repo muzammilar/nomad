@@ -6,6 +6,7 @@ package stream
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync/atomic"
 
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -48,9 +49,9 @@ type Subscription struct {
 }
 
 type SubscribeRequest struct {
-	Token     string
-	Index     uint64
-	Namespace string
+	Token      string
+	Index      uint64
+	Namespaces []string
 
 	Topics map[structs.Topic][]string
 
@@ -59,6 +60,11 @@ type SubscribeRequest struct {
 	// the closest index in the buffer will be returned if there is not
 	// an exact match
 	StartExactlyAtIndex bool
+
+	// Authenticate is a callback that authenticates the token
+	// associated with the SubscribeRequest has not expired and
+	// has the correct permissions
+	Authenticate func() error
 }
 
 func newSubscription(req *SubscribeRequest, item *bufferItem, unsub func()) *Subscription {
@@ -125,15 +131,10 @@ func filter(req *SubscribeRequest, events []structs.Event) []structs.Event {
 
 	allTopicKeys := req.Topics[structs.TopicAll]
 
-	// Return all events if subscribed to all namespaces and all topics
-	if req.Namespace == "*" && len(allTopicKeys) == 1 && allTopicKeys[0] == string(structs.TopicAll) {
-		return events
-	}
-
 	var result []structs.Event
 
 	for _, event := range events {
-		if req.Namespace != "*" && event.Namespace != "" && event.Namespace != req.Namespace {
+		if event.Namespace != "" && !slices.Contains(req.Namespaces, event.Namespace) {
 			continue
 		}
 

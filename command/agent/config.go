@@ -229,6 +229,10 @@ type ClientConfig struct {
 	// AllocMountsDir is the directory for storing mounts into allocation data
 	AllocMountsDir string `hcl:"alloc_mounts_dir"`
 
+	// HostVolumesDir is the suggested directory for plugins to put volumes.
+	// Volume plugins may ignore this suggestion, but we provide this default.
+	HostVolumesDir string `hcl:"host_volumes_dir"`
+
 	// HostVolumePluginDir directory contains dynamic host volume plugins
 	HostVolumePluginDir string `hcl:"host_volume_plugin_dir"`
 
@@ -270,6 +274,9 @@ type ClientConfig struct {
 	// NetworkSpeed is used to override any detected or default network link
 	// speed.
 	NetworkSpeed int `hcl:"network_speed"`
+
+	// CpuDisableDmidecode is used to disable dmidecode usage for CPU calculation
+	CpuDisableDmidecode bool `hcl:"cpu_disable_dmidecode"`
 
 	// CpuCompute is used to override any detected or default total CPU compute.
 	CpuCompute int `hcl:"cpu_total_compute"`
@@ -2319,6 +2326,9 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 	if b.AllocMountsDir != "" {
 		result.AllocMountsDir = b.AllocMountsDir
 	}
+	if b.HostVolumesDir != "" {
+		result.HostVolumesDir = b.HostVolumesDir
+	}
 	if b.HostVolumePluginDir != "" {
 		result.HostVolumePluginDir = b.HostVolumePluginDir
 	}
@@ -2338,6 +2348,9 @@ func (a *ClientConfig) Merge(b *ClientConfig) *ClientConfig {
 
 	if b.NetworkSpeed != 0 {
 		result.NetworkSpeed = b.NetworkSpeed
+	}
+	if b.CpuDisableDmidecode {
+		result.CpuDisableDmidecode = b.CpuDisableDmidecode
 	}
 	if b.CpuCompute != 0 {
 		result.CpuCompute = b.CpuCompute

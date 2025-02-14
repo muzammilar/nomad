@@ -123,6 +123,9 @@ type Config struct {
 	// be determined dynamically.
 	NetworkSpeed int
 
+	// CpuDisableDmidecode disables cpu fingerprinting using dmidecode on Linux
+	CpuDisableDmidecode bool
+
 	// CpuCompute is the default total CPU compute if they can not be determined
 	// dynamically. It should be given as Cores * MHz (2 Cores * 2 Ghz = 4000)
 	CpuCompute int
@@ -314,6 +317,10 @@ type Config struct {
 	// HostVolumes is a map of the configured host volumes by name.
 	HostVolumes map[string]*structs.ClientHostVolumeConfig
 
+	// HostVolumesDir is the suggested directory for plugins to put volumes.
+	// Volume plugins may ignore this suggestion, but we provide this default.
+	HostVolumesDir string
+
 	// HostVolumePluginDir is the directory with dynamic host volume plugins.
 	HostVolumePluginDir string
 
@@ -458,13 +465,19 @@ func DefaultTemplateConfig() *ClientTemplateConfig {
 			Max: pointer.Of(4 * time.Minute),
 		},
 		ConsulRetry: &RetryConfig{
-			Attempts: pointer.Of(0), // unlimited
+			Attempts:   pointer.Of(12),
+			Backoff:    pointer.Of(time.Millisecond * 250),
+			MaxBackoff: pointer.Of(time.Minute),
 		},
 		VaultRetry: &RetryConfig{
-			Attempts: pointer.Of(0), // unlimited
+			Attempts:   pointer.Of(12),
+			Backoff:    pointer.Of(time.Millisecond * 250),
+			MaxBackoff: pointer.Of(time.Minute),
 		},
 		NomadRetry: &RetryConfig{
-			Attempts: pointer.Of(0), // unlimited
+			Attempts:   pointer.Of(12),
+			Backoff:    pointer.Of(time.Millisecond * 250),
+			MaxBackoff: pointer.Of(time.Minute),
 		},
 	}
 }

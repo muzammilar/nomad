@@ -7,29 +7,34 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/useragent"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
 	vapi "github.com/hashicorp/vault/api"
 )
 
-var vaultBaseFingerprintInterval = 15 * time.Second
-
 // VaultFingerprint is used to fingerprint for Vault
 type VaultFingerprint struct {
 	logger log.Logger
 	states map[string]*vaultFingerprintState
+
+	// Once initial fingerprints are complete, we no-op all periodic
+	// fingerprints to prevent Vault availability issues causing a thundering
+	// herd of node updates. This behavior resets if we reload the
+	// configuration.
+	initialResponse     *FingerprintResponse
+	initialResponseLock sync.RWMutex
 }
 
 type vaultFingerprintState struct {
-	client      *vapi.Client
-	isAvailable bool
-	nextCheck   time.Time
+	client            *vapi.Client
+	isAvailable       bool
+	fingerprintedOnce bool
 }
 
 // NewVaultFingerprint is used to create a Vault fingerprint
@@ -41,6 +46,9 @@ func NewVaultFingerprint(logger log.Logger) Fingerprint {
 }
 
 func (f *VaultFingerprint) Fingerprint(req *FingerprintRequest, resp *FingerprintResponse) error {
+	if f.readInitialResponse(resp) {
+		return nil
+	}
 	var mErr *multierror.Error
 	vaultConfigs := req.Config.GetVaultConfigs(f.logger)
 
@@ -51,21 +59,51 @@ func (f *VaultFingerprint) Fingerprint(req *FingerprintRequest, resp *Fingerprin
 		}
 	}
 
+	fingerprintCount := 0
+	for _, state := range f.states {
+		if state.fingerprintedOnce {
+			fingerprintCount++
+		}
+	}
+	if fingerprintCount == len(vaultConfigs) {
+		f.setInitialResponse(resp)
+	}
+
 	return mErr.ErrorOrNil()
+}
+
+// readInitialResponse checks for a previously seen response. It returns true
+// and shallow-copies the response into the argument if one is available. We
+// only want to hold the lock open during the read and not the Fingerprint so
+// that we don't block a Reload call while waiting for Vault requests to
+// complete. If the Reload clears the initialResponse after we take the lock
+// again in setInitialResponse (ex. 2 reloads quickly in a row), the worst that
+// happens is we do an extra fingerprint when the Reload caller calls
+// Fingerprint
+func (f *VaultFingerprint) readInitialResponse(resp *FingerprintResponse) bool {
+	f.initialResponseLock.RLock()
+	defer f.initialResponseLock.RUnlock()
+	if f.initialResponse != nil {
+		*resp = *f.initialResponse
+		return true
+	}
+	return false
+}
+
+func (f *VaultFingerprint) setInitialResponse(resp *FingerprintResponse) {
+	f.initialResponseLock.Lock()
+	defer f.initialResponseLock.Unlock()
+	f.initialResponse = resp
 }
 
 // fingerprintImpl fingerprints for a single Vault cluster
 func (f *VaultFingerprint) fingerprintImpl(cfg *config.VaultConfig, resp *FingerprintResponse) error {
-
 	logger := f.logger.With("cluster", cfg.Name)
 
 	state, ok := f.states[cfg.Name]
 	if !ok {
 		state = &vaultFingerprintState{}
 		f.states[cfg.Name] = state
-	}
-	if state.nextCheck.After(time.Now()) {
-		return nil
 	}
 
 	// Only create the client once to avoid creating too many connections to Vault
@@ -89,7 +127,6 @@ func (f *VaultFingerprint) fingerprintImpl(cfg *config.VaultConfig, resp *Finger
 			logger.Info("Vault is unavailable")
 		}
 		state.isAvailable = false
-		state.nextCheck = time.Time{} // always check on next interval
 		return nil
 	}
 
@@ -111,30 +148,18 @@ func (f *VaultFingerprint) fingerprintImpl(cfg *config.VaultConfig, resp *Finger
 		logger.Info("Vault is available")
 	}
 
-	// Widen the minimum window to the next check so that if one out of a set of
-	// Vaults is unhealthy we don't greatly increase requests to the healthy
-	// ones. This is less than the minimum window if all Vaults are healthy so
-	// that we don't desync from the larger window provided by Periodic
-	state.nextCheck = time.Now().Add(29 * time.Second)
 	state.isAvailable = true
-
+	state.fingerprintedOnce = true
 	resp.Detected = true
 
 	return nil
 }
 
 func (f *VaultFingerprint) Periodic() (bool, time.Duration) {
-	if len(f.states) == 0 {
-		return true, vaultBaseFingerprintInterval
-	}
-	for _, state := range f.states {
-		if !state.isAvailable {
-			return true, vaultBaseFingerprintInterval
-		}
-	}
+	return true, 15 * time.Second
+}
 
-	// Once all Vaults are initially discovered and healthy we fingerprint with
-	// a wide jitter to avoid thundering herds of fingerprints against central
-	// Vault servers.
-	return true, (30 * time.Second) + helper.RandomStagger(90*time.Second)
+// Reload satisfies ReloadableFingerprint and resets the gate on periodic fingerprinting.
+func (f *VaultFingerprint) Reload() {
+	f.setInitialResponse(nil)
 }

@@ -18,9 +18,9 @@ import (
 	"sync"
 	"time"
 
-	metrics "github.com/armon/go-metrics"
 	consulapi "github.com/hashicorp/consul/api"
 	hclog "github.com/hashicorp/go-hclog"
+	metrics "github.com/hashicorp/go-metrics/compat"
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/allocrunner"
@@ -54,6 +54,7 @@ import (
 	"github.com/hashicorp/nomad/command/agent/consul"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/envoy"
+	"github.com/hashicorp/nomad/helper/escapingfs"
 	"github.com/hashicorp/nomad/helper/goruntime"
 	"github.com/hashicorp/nomad/helper/group"
 	"github.com/hashicorp/nomad/helper/pointer"
@@ -539,8 +540,9 @@ func NewClient(cfg *config.Config, consulCatalog consul.CatalogAPI, consulProxie
 
 	// set up dynamic host volume manager
 	c.hostVolumeManager = hvm.NewHostVolumeManager(logger, hvm.Config{
-		PluginDir:      cfg.HostVolumePluginDir,
-		SharedMountDir: cfg.AllocMountsDir,
+		PluginDir:      c.GetConfig().HostVolumePluginDir,
+		VolumesDir:     c.GetConfig().HostVolumesDir,
+		NodePool:       c.Node().NodePool,
 		StateMgr:       c.stateDB,
 		UpdateNodeVols: c.batchNodeUpdates.updateNodeFromHostVolume,
 	})
@@ -702,6 +704,13 @@ func (c *Client) init() error {
 
 	c.stateDB = db
 
+	// Ensure host_volumes_dir config is not empty.
+	if conf.HostVolumesDir == "" {
+		conf = c.UpdateConfig(func(c *config.Config) {
+			c.HostVolumesDir = filepath.Join(conf.StateDir, "host_volumes")
+		})
+	}
+
 	// Ensure the alloc mounts dir exists if we are configured with a custom path.
 	if conf.AllocMountsDir != "" {
 		if err := os.MkdirAll(conf.AllocMountsDir, 0o711); err != nil {
@@ -753,6 +762,26 @@ func (c *Client) init() error {
 
 	// setup the nsd check store
 	c.checkStore = checkstore.NewStore(c.logger, c.stateDB)
+
+	// COMPAT(1.12.0): remove in Nomad 1.12.0
+	oldCNIDir := "/var/lib/cni/networks/nomad"
+	newCNIDir := "/var/run/cni/nomad"
+	if _, err := os.Stat(newCNIDir); os.IsNotExist(err) {
+		if _, err := os.Stat(oldCNIDir); err == nil {
+			err := escapingfs.CopyDir(oldCNIDir, newCNIDir)
+			if err != nil {
+				c.logger.Error("failed to migrate existing CNI state",
+					"error", err, "src", oldCNIDir, "dest", newCNIDir)
+			} else {
+				err := os.RemoveAll(oldCNIDir)
+				if err != nil {
+					c.logger.Error("migrated CNI state but could not remove old state",
+						"error", err, "src", oldCNIDir, "dest", newCNIDir)
+				}
+				c.logger.Info("migrated CNI state", "src", oldCNIDir, "dest", newCNIDir)
+			}
+		}
+	}
 
 	return nil
 }
@@ -1568,14 +1597,12 @@ func (c *Client) setupNode() error {
 	}
 	node.CgroupParent = newConfig.CgroupParent
 	if node.HostVolumes == nil {
-		if l := len(newConfig.HostVolumes); l != 0 {
-			node.HostVolumes = make(map[string]*structs.ClientHostVolumeConfig, l)
-			for k, v := range newConfig.HostVolumes {
-				if _, err := os.Stat(v.Path); err != nil {
-					return fmt.Errorf("failed to validate volume %s, err: %v", v.Name, err)
-				}
-				node.HostVolumes[k] = v.Copy()
+		node.HostVolumes = make(map[string]*structs.ClientHostVolumeConfig, len(newConfig.HostVolumes))
+		for k, v := range newConfig.HostVolumes {
+			if _, err := os.Stat(v.Path); err != nil {
+				return fmt.Errorf("failed to validate volume %s, err: %w", v.Name, err)
 			}
+			node.HostVolumes[k] = v.Copy()
 		}
 	}
 	if node.HostNetworks == nil {
