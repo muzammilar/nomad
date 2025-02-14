@@ -10,7 +10,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/client/config"
@@ -54,7 +53,7 @@ func newConsulFingerPrint(t *testing.T) *ConsulFingerprint {
 func TestConsulFingerprint_server(t *testing.T) {
 	ci.Parallel(t)
 
-	cfs := consulFingerprintState{}
+	cfs := new(consulState)
 
 	t.Run("is server", func(t *testing.T) {
 		s, ok := cfs.server(agentconsul.Self{
@@ -90,7 +89,7 @@ func TestConsulFingerprint_server(t *testing.T) {
 func TestConsulFingerprint_version(t *testing.T) {
 	ci.Parallel(t)
 
-	cfs := consulFingerprintState{}
+	cfs := new(consulState)
 
 	t.Run("oss", func(t *testing.T) {
 		v, ok := cfs.version(agentconsul.Self{
@@ -126,7 +125,7 @@ func TestConsulFingerprint_version(t *testing.T) {
 func TestConsulFingerprint_sku(t *testing.T) {
 	ci.Parallel(t)
 
-	cfs := consulFingerprintState{}
+	cfs := new(consulState)
 
 	t.Run("oss", func(t *testing.T) {
 		s, ok := cfs.sku(agentconsul.Self{
@@ -186,7 +185,7 @@ func TestConsulFingerprint_sku(t *testing.T) {
 func TestConsulFingerprint_revision(t *testing.T) {
 	ci.Parallel(t)
 
-	cfs := consulFingerprintState{}
+	cfs := new(consulState)
 
 	t.Run("ok", func(t *testing.T) {
 		r, ok := cfs.revision(agentconsul.Self{
@@ -214,7 +213,7 @@ func TestConsulFingerprint_revision(t *testing.T) {
 func TestConsulFingerprint_dc(t *testing.T) {
 	ci.Parallel(t)
 
-	cfs := consulFingerprintState{}
+	cfs := new(consulState)
 
 	t.Run("ok", func(t *testing.T) {
 		dc, ok := cfs.dc(agentconsul.Self{
@@ -242,7 +241,7 @@ func TestConsulFingerprint_dc(t *testing.T) {
 func TestConsulFingerprint_segment(t *testing.T) {
 	ci.Parallel(t)
 
-	cfs := consulFingerprintState{}
+	cfs := new(consulState)
 
 	t.Run("ok", func(t *testing.T) {
 		s, ok := cfs.segment(agentconsul.Self{
@@ -277,7 +276,7 @@ func TestConsulFingerprint_segment(t *testing.T) {
 func TestConsulFingerprint_connect(t *testing.T) {
 	ci.Parallel(t)
 
-	cfs := consulFingerprintState{}
+	cfs := new(consulState)
 
 	t.Run("connect enabled", func(t *testing.T) {
 		s, ok := cfs.connect(agentconsul.Self{
@@ -306,7 +305,7 @@ func TestConsulFingerprint_connect(t *testing.T) {
 func TestConsulFingerprint_grpc(t *testing.T) {
 	ci.Parallel(t)
 
-	cfs := consulFingerprintState{}
+	cfs := new(consulState)
 
 	t.Run("grpc set pre-1.14 http", func(t *testing.T) {
 		s, ok := cfs.grpc("http", testlog.HCLogger(t))(agentconsul.Self{
@@ -407,7 +406,7 @@ func TestConsulFingerprint_grpc(t *testing.T) {
 func TestConsulFingerprint_namespaces(t *testing.T) {
 	ci.Parallel(t)
 
-	cfs := consulFingerprintState{}
+	cfs := new(consulState)
 
 	t.Run("supports namespaces", func(t *testing.T) {
 		value, ok := cfs.namespaces(agentconsul.Self{
@@ -448,7 +447,7 @@ func TestConsulFingerprint_namespaces(t *testing.T) {
 func TestConsulFingerprint_partition(t *testing.T) {
 	ci.Parallel(t)
 
-	cfs := consulFingerprintState{}
+	cfs := new(consulState)
 
 	t.Run("oss", func(t *testing.T) {
 		p, ok := cfs.partition(agentconsul.Self{
@@ -494,7 +493,7 @@ func TestConsulFingerprint_partition(t *testing.T) {
 func TestConsulFingerprint_dns(t *testing.T) {
 	ci.Parallel(t)
 
-	cfs := consulFingerprintState{}
+	cfs := new(consulState)
 
 	t.Run("dns port not enabled", func(t *testing.T) {
 		port, ok := cfs.dnsPort(agentconsul.Self{
@@ -601,7 +600,7 @@ func TestConsulFingerprint_Fingerprint_oss(t *testing.T) {
 	node := &structs.Node{Attributes: make(map[string]string)}
 
 	// consul not available before first run
-	must.Nil(t, cf.states[structs.ConsulDefaultCluster])
+	must.Nil(t, cf.clusters[structs.ConsulDefaultCluster])
 
 	// execute first query with good response
 	var resp FingerprintResponse
@@ -623,7 +622,7 @@ func TestConsulFingerprint_Fingerprint_oss(t *testing.T) {
 	must.True(t, resp.Detected)
 
 	// consul now available
-	must.True(t, cf.states[structs.ConsulDefaultCluster].isAvailable)
+	must.NotNil(t, cf.clusters[structs.ConsulDefaultCluster])
 
 	var resp2 FingerprintResponse
 
@@ -638,23 +637,28 @@ func TestConsulFingerprint_Fingerprint_oss(t *testing.T) {
 	node.Attributes["connect.grpc"] = "foo"
 	node.Attributes["unique.consul.name"] = "foo"
 
-	// Reset the nextCheck time for testing purposes, or we won't pick up the
-	// change until the next period, up to 2min from now
-	cf.states[structs.ConsulDefaultCluster].nextCheck = time.Now()
-
-	// execute second query with error
+	// execute second query with error but without reload
 	err2 := cf.Fingerprint(&FingerprintRequest{Config: cfg, Node: node}, &resp2)
-	must.NoError(t, err2)         // does not return error
-	must.Nil(t, resp2.Attributes) // attributes unset so they don't change
-	must.True(t, resp.Detected)   // never downgrade
+	must.NoError(t, err2)                         // does not return error
+	must.Eq(t, resp.Attributes, resp2.Attributes) // attributes unset don't change
+	must.True(t, resp.Detected)                   // never downgrade
 
-	// consul no longer available
-	must.False(t, cf.states[structs.ConsulDefaultCluster].isAvailable)
+	// Consul no longer available but an agent reload is required to clear a
+	// detected cluster
+	must.NotNil(t, cf.clusters[structs.ConsulDefaultCluster])
 
-	// execute third query no error
+	// Reload to reset
+	cf.Reload()
 	var resp3 FingerprintResponse
 	err3 := cf.Fingerprint(&FingerprintRequest{Config: cfg, Node: node}, &resp3)
-	must.NoError(t, err3)
+	must.NoError(t, err3)         // does not return error
+	must.Nil(t, resp3.Attributes) // attributes reset
+	must.True(t, resp3.Detected)  // detection is never reset
+
+	// execute 4th query no error
+	var resp4 FingerprintResponse
+	err4 := cf.Fingerprint(&FingerprintRequest{Config: cfg, Node: node}, &resp4)
+	must.NoError(t, err4)
 	must.Eq(t, map[string]string{
 		"consul.datacenter":    "dc1",
 		"consul.revision":      "3c1c22679",
@@ -667,10 +671,10 @@ func TestConsulFingerprint_Fingerprint_oss(t *testing.T) {
 		"consul.dns.port":      "8600",
 		"consul.ft.namespaces": "false",
 		"unique.consul.name":   "HAL9000",
-	}, resp3.Attributes)
+	}, resp4.Attributes)
 
 	// consul now available again
-	must.True(t, cf.states[structs.ConsulDefaultCluster].isAvailable)
+	must.NotNil(t, cf.clusters[structs.ConsulDefaultCluster])
 	must.True(t, resp.Detected)
 }
 
@@ -685,7 +689,7 @@ func TestConsulFingerprint_Fingerprint_ent(t *testing.T) {
 	node := &structs.Node{Attributes: make(map[string]string)}
 
 	// consul not available before first run
-	must.Nil(t, cf.states[structs.ConsulDefaultCluster])
+	must.Nil(t, cf.clusters[structs.ConsulDefaultCluster])
 
 	// execute first query with good response
 	var resp FingerprintResponse
@@ -709,7 +713,7 @@ func TestConsulFingerprint_Fingerprint_ent(t *testing.T) {
 	must.True(t, resp.Detected)
 
 	// consul now available
-	must.True(t, cf.states[structs.ConsulDefaultCluster].isAvailable)
+	must.NotNil(t, cf.clusters[structs.ConsulDefaultCluster])
 
 	var resp2 FingerprintResponse
 
@@ -725,23 +729,28 @@ func TestConsulFingerprint_Fingerprint_ent(t *testing.T) {
 	node.Attributes["connect.grpc"] = "foo"
 	node.Attributes["unique.consul.name"] = "foo"
 
-	// Reset the nextCheck time for testing purposes, or we won't pick up the
-	// change until the next period, up to 2min from now
-	cf.states[structs.ConsulDefaultCluster].nextCheck = time.Now()
-
-	// execute second query with error
+	// execute second query with error but without reload
 	err2 := cf.Fingerprint(&FingerprintRequest{Config: cfg, Node: node}, &resp2)
-	must.NoError(t, err2)         // does not return error
-	must.Nil(t, resp2.Attributes) // attributes unset so they don't change
-	must.True(t, resp.Detected)   // never downgrade
+	must.NoError(t, err2)                         // does not return error
+	must.Eq(t, resp.Attributes, resp2.Attributes) // attributes unset don't change
+	must.True(t, resp.Detected)                   // never downgrade
 
-	// consul no longer available
-	must.False(t, cf.states[structs.ConsulDefaultCluster].isAvailable)
+	// Consul no longer available but an agent reload is required to clear a
+	// detected cluster
+	must.NotNil(t, cf.clusters[structs.ConsulDefaultCluster])
 
-	// execute third query no error
+	// Reload to reset
+	cf.Reload()
 	var resp3 FingerprintResponse
 	err3 := cf.Fingerprint(&FingerprintRequest{Config: cfg, Node: node}, &resp3)
-	must.NoError(t, err3)
+	must.NoError(t, err3)         // does not return error
+	must.Nil(t, resp3.Attributes) // attributes reset
+	must.True(t, resp3.Detected)  // detection is never reset
+
+	// execute 4th query no error
+	var resp4 FingerprintResponse
+	err4 := cf.Fingerprint(&FingerprintRequest{Config: cfg, Node: node}, &resp4)
+	must.NoError(t, err4)
 	must.Eq(t, map[string]string{
 		"consul.datacenter":    "dc1",
 		"consul.revision":      "22ce6c6ad",
@@ -756,9 +765,9 @@ func TestConsulFingerprint_Fingerprint_ent(t *testing.T) {
 		"consul.dns.port":      "8600",
 		"consul.partition":     "default",
 		"unique.consul.name":   "HAL9000",
-	}, resp3.Attributes)
+	}, resp4.Attributes)
 
 	// consul now available again
-	must.True(t, cf.states[structs.ConsulDefaultCluster].isAvailable)
-	must.True(t, resp.Detected)
+	must.NotNil(t, cf.clusters[structs.ConsulDefaultCluster])
+	must.True(t, resp4.Detected)
 }

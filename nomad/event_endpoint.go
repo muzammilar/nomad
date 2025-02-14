@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/go-msgpack/v2/codec"
 
+	"github.com/hashicorp/nomad/acl"
 	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/nomad/stream"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -40,6 +41,10 @@ func (e *Event) stream(conn io.ReadWriteCloser) {
 	}
 
 	authErr := e.srv.Authenticate(nil, &args)
+	if authErr != nil {
+		handleJsonResultError(structs.ErrPermissionDenied, pointer.Of(int64(403)), encoder)
+		return
+	}
 
 	// forward to appropriate region
 	if args.Region != e.srv.config.Region {
@@ -51,16 +56,38 @@ func (e *Event) stream(conn io.ReadWriteCloser) {
 	}
 
 	e.srv.MeasureRPCRate("event", structs.RateMetricRead, &args)
-	if authErr != nil {
+
+	resolvedACL, err := e.srv.ResolveACL(&args)
+	if err != nil {
 		handleJsonResultError(structs.ErrPermissionDenied, pointer.Of(int64(403)), encoder)
+		return
+	}
+
+	validatedNses, err := e.validateACL(args.Namespace, args.Topics, resolvedACL)
+	if err != nil {
+		handleJsonResultError(structs.ErrPermissionDenied, pointer.Of(int64(403)), encoder)
+		return
 	}
 
 	// Generate the subscription request
 	subReq := &stream.SubscribeRequest{
-		Token:     args.AuthToken,
-		Topics:    args.Topics,
-		Index:     uint64(args.Index),
-		Namespace: args.Namespace,
+		Token:  args.AuthToken,
+		Topics: args.Topics,
+		Index:  uint64(args.Index),
+		// Namespaces is set once, in the event a users ACL is updated to include
+		// more NSes, the current event stream will not include the new NSes.
+		Namespaces: validatedNses,
+		Authenticate: func() error {
+			if err := e.srv.Authenticate(nil, &args); err != nil {
+				return err
+			}
+			resolvedACL, err := e.srv.ResolveACL(&args)
+			if err != nil {
+				return err
+			}
+			_, err = e.validateACL(args.Namespace, args.Topics, resolvedACL)
+			return err
+		},
 	}
 
 	// Get the servers broker and subscribe
@@ -74,20 +101,20 @@ func (e *Event) stream(conn io.ReadWriteCloser) {
 	var subscription *stream.Subscription
 	var subErr error
 
-	// Track whether the ACL token being used has an expiry time.
-	var expiryTime *time.Time
-
-	// Check required ACL permissions for requested Topics
-	if e.srv.config.ACLEnabled {
-		subscription, expiryTime, subErr = publisher.SubscribeWithACLCheck(subReq)
-	} else {
-		subscription, subErr = publisher.Subscribe(subReq)
-	}
+	subscription, subErr = publisher.Subscribe(subReq)
 	if subErr != nil {
 		handleJsonResultError(subErr, pointer.Of(int64(500)), encoder)
 		return
 	}
 	defer subscription.Unsubscribe()
+
+	// because we have authenticated, the identity will be set, so extract expiration time
+	var exp time.Time
+	if c := args.GetIdentity().GetClaims(); c != nil {
+		exp = c.Expiry.Time()
+	} else if t := args.GetIdentity().GetACLToken(); t != nil && t.ExpirationTime != nil {
+		exp = *t.ExpirationTime
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -111,9 +138,9 @@ func (e *Event) stream(conn io.ReadWriteCloser) {
 				return
 			}
 
-			// Ensure the token being used is not expired before we any events
+			// Ensure the token being used is not expired before we send any events
 			// to subscribers.
-			if expiryTime != nil && expiryTime.Before(time.Now().UTC()) {
+			if !exp.IsZero() && exp.Before(time.Now().UTC()) {
 				select {
 				case errCh <- structs.ErrTokenExpired:
 				case <-ctx.Done():
@@ -212,4 +239,67 @@ func handleJsonResultError(err error, code *int64, encoder *codec.Encoder) {
 	encoder.Encode(&structs.EventStreamWrapper{
 		Error: structs.NewRpcError(err, code),
 	})
+}
+
+// validateACL handles wildcard namespaces by replacing it with all existing namespaces
+// and validates the user has the appropriate ACL to read topics in each one.
+func (e *Event) validateACL(namespace string, topics map[structs.Topic][]string, resolvedAcl *acl.ACL) ([]string, error) {
+	nses := []string{}
+	if namespace == structs.AllNamespacesSentinel {
+		ns, _ := e.srv.State().NamespaceNames()
+		nses = append(nses, ns...)
+	} else {
+		nses = append(nses, namespace)
+	}
+
+	for _, ns := range nses {
+		if err := validateNsOp(ns, topics, resolvedAcl); err != nil {
+			return nil, err
+		}
+	}
+	return nses, nil
+}
+
+func validateNsOp(namespace string, topics map[structs.Topic][]string, aclObj *acl.ACL) error {
+	for topic := range topics {
+		switch topic {
+		case structs.TopicDeployment,
+			structs.TopicEvaluation,
+			structs.TopicAllocation,
+			structs.TopicJob,
+			structs.TopicService:
+			if ok := aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityReadJob); !ok {
+				return structs.ErrPermissionDenied
+			}
+		case structs.TopicHostVolume:
+			if ok := aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityHostVolumeRead); !ok {
+				return structs.ErrPermissionDenied
+			}
+		case structs.TopicCSIVolume:
+			if ok := aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityCSIReadVolume); !ok {
+				return structs.ErrPermissionDenied
+			}
+		case structs.TopicCSIPlugin:
+			if ok := aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityReadJob); !ok {
+				return structs.ErrPermissionDenied
+			}
+		case structs.TopicNode:
+			if ok := aclObj.AllowNodeRead(); !ok {
+				return structs.ErrPermissionDenied
+			}
+		case structs.TopicNodePool:
+			// Require management token for node pools since we can't filter
+			// out node pools the token doesn't have access to.
+			if ok := aclObj.IsManagement(); !ok {
+				return structs.ErrPermissionDenied
+			}
+		default:
+			if ok := aclObj.IsManagement(); !ok {
+				return structs.ErrPermissionDenied
+			}
+		}
+	}
+
+	return nil
+
 }
